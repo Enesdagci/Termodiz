@@ -1,0 +1,33 @@
+name: termodiz
+description: "Getting temperature from esp32"
+publish_to: 'none' 
+
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.0
+dependencies:
+  flutter:
+    sdk: flutter
+
+  share_plus: ^7.2.1
+  sqflite: ^2.4.2+1
+  path: ^1.9.1
+  path_provider: ^2.1.1
+  permission_handler: ^11.3.1
+
+  flutter_blue_plus: ^1.32.12
+  fl_chart: ^0.68.0
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+
+  uses-material-design: true

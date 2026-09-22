@@ -2,17 +2,21 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:fl_chart/fl_chart.dart';
-import 'package:permission_handler/permission_handler.dart';
 import '../models/hasta.dart';
 import '../services/database_service.dart';
 import 'gecmis_sayfasi.dart';
 
-// ESP32 kodundaki UUID'lerle birebir eşleşmeli
-const String cihazIsmi = "DizSensor";
-const String servisUuid = "12345678-1234-1234-1234-1234567890ab";
-const String karakteristikUuid = "abcd1234-ab12-cd34-ef56-1234567890ab";
+// ESP32 artık kendi ağını yaymıyor — telefonun mobil hotspot'una istemci
+// (station) olarak bağlanıyor. Bu yüzden IP adresi SABİT DEĞİL: telefon,
+// hotspot'a her katılan cihaza DHCP ile farklı bir IP verebilir. Bu yüzden
+// IP'yi koda sabit yazmak yerine kullanıcıdan alıp SharedPreferences'ta
+// saklıyoruz — Serial Monitor'de "ESP32 adresi: http://..." satırında
+// yazan IP'yi kullanıcı bir kere girer, sonraki açılışlarda hatırlanır.
+const String _varsayilanEsp32Ip = "192.168.4.1";
+const String _esp32IpAnahtari = "esp32_ip_adresi";
 
 class GrafikSayfasi extends StatefulWidget {
   final Hasta hasta;
@@ -32,11 +36,26 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
   final List<double> _b4 = [];
 
   String _durum = "Bağlı değil";
-  BluetoothDevice? _cihaz;
-  int _kopmaSayaci = 0; // gerçek BLE kopması olursa otomatik yeniden bağlanmak için kullanılır
-  StreamSubscription<BluetoothConnectionState>? _baglantiDurumuAbonelik;
+  bool _bagli = false;
+  String _esp32Ip = _varsayilanEsp32Ip;
+  Timer? _pollTimer;
+  bool _istekDevamEdiyor = false; // önceki HTTP isteği bitmeden yenisini başlatma
 
-  // Veri tazeliği: son paketin ne zaman geldiğini gösterip, sessizce bayatlamış
+  // store-and-forward senkronizasyon: ESP32'nin ürettiği kayıtlar "sira" ile
+  // numaralanıyor. Biz en son işlediğimiz sira'yı hatırlıyoruz ve her istekte
+  // "bundan sonrasını ver" diyoruz — böylece ekran kapansa/uygulama kapansa
+  // bile kaldığımız yerden devam ederiz, veri kaybolmaz.
+  int _sonSira = 0;
+  String get _sonSiraAnahtari => 'son_sira_${widget.hasta.id}';
+
+  int _paketSayaci = 0; // başarıyla işlenen TOPLAM kayıt sayısı
+  int _toplamIstekSayisi = 0; // atılan TOPLAM HTTP isteği sayısı (teşhis için)
+  int _ardisikBasarisizSayisi = 0; // üst üste başarısız istek sayısı
+  int _kopmaSayaci = 0; // bağlantının kaybedildiği tespit edilen an sayısı
+  String _sonHam = ""; // en son gelen HTTP yanıtının (kısaltılmış) metni
+  bool _veriKaybiUyarisiGosterildi = false; // ESP32 arabelleği taşıp veri kalıcı kaybolduysa
+
+  // Veri tazeliği: son kaydın ne zaman geldiğini gösterip, sessizce bayatlamış
   // veriyi "canlı" gibi göstermeyi önler.
   DateTime? _sonPaketZamani;
   Timer? _tazelikTimer;
@@ -49,236 +68,219 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
     _tazelikTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
     });
+    _esp32IpYukle();
+  }
+
+  // Daha önce kaydedilmiş ESP32 IP'si varsa yükler (uygulama yeniden açılsa
+  // bile kullanıcı IP'yi tekrar girmek zorunda kalmasın diye).
+  Future<void> _esp32IpYukle() async {
+    try {
+      final tercihler = await SharedPreferences.getInstance();
+      final kayitliIp = tercihler.getString(_esp32IpAnahtari);
+      if (kayitliIp != null && kayitliIp.isNotEmpty && mounted) {
+        setState(() => _esp32Ip = kayitliIp);
+      }
+    } catch (e) {
+      debugPrint("UYARI: Kaydedilmiş ESP32 IP okunamadı: $e");
+    }
+  }
+
+  // Kullanıcıya ESP32'nin güncel IP'sini (Serial Monitor'den okuduğu) girmesi
+  // için bir diyalog gösterir ve girilen değeri kalıcı olarak kaydeder.
+  Future<void> _ipDegistirDiyaloguGoster() async {
+    final denetleyici = TextEditingController(text: _esp32Ip);
+    final yeniIp = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('ESP32 IP Adresi'),
+        content: TextField(
+          controller: denetleyici,
+          autofocus: true,
+          keyboardType: TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(
+            hintText: 'örn: 10.245.88.47',
+            helperText: 'Serial Monitor\'deki "ESP32 adresi: http://..." satırında yazan IP',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('İptal'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, denetleyici.text.trim()),
+            child: const Text('Kaydet'),
+          ),
+        ],
+      ),
+    );
+
+    if (yeniIp != null && yeniIp.isNotEmpty && yeniIp != _esp32Ip) {
+      setState(() => _esp32Ip = yeniIp);
+      try {
+        final tercihler = await SharedPreferences.getInstance();
+        await tercihler.setString(_esp32IpAnahtari, yeniIp);
+      } catch (e) {
+        debugPrint("UYARI: ESP32 IP kaydedilemedi: $e");
+      }
+    }
   }
 
   @override
   void dispose() {
-    _ilkVeriBekleTimer?.cancel();
+    _pollTimer?.cancel();
     _tazelikTimer?.cancel();
-    _baglantiDurumuAbonelik?.cancel();
-    _cihaz?.disconnect();
     super.dispose();
   }
 
   Future<void> _baglan() async {
-    // 1. Adım: İzinleri iste
-    setState(() => _durum = "İzinler isteniyor...");
-    final durumlar = await [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-    ].request();
-
-    debugPrint("İzin sonuçları: $durumlar");
-
-    final hepsiVerildi = durumlar.values.every((s) => s.isGranted);
-    if (!hepsiVerildi) {
-      setState(() => _durum = "İzin reddedildi — Ayarlar'dan Bluetooth/Konum iznini aç");
-      debugPrint("HATA: Gerekli izinler verilmedi.");
-      return;
-    }
-
-    // 2. Adım: Bluetooth açık mı kontrol et
-    if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
-      setState(() => _durum = "Bluetooth kapalı — lütfen açın");
-      debugPrint("HATA: Bluetooth adaptörü kapalı.");
-      return;
-    }
-
-    // 3. Adım: Tara
-    setState(() => _durum = "Taranıyor...");
-    debugPrint("Tarama başladı, aranan cihaz ismi: $cihazIsmi");
-
-    bool cihazBulundu = false;
-
-    // ÖNEMLİ: Dinleyici, tarama başlamadan ÖNCE kurulmalı — aksi halde
-    // startScan'in (timeout ile) tamamlanmasını beklerken gelen sonuçlar kaçırılır.
-    late final StreamSubscription<List<ScanResult>> taramaAbonelik;
-    taramaAbonelik = FlutterBluePlus.scanResults.listen((sonuclar) async {
-      debugPrint("Taramada ${sonuclar.length} cihaz görüldü.");
-      for (final sonuc in sonuclar) {
-        debugPrint("  -> Bulunan cihaz: '${sonuc.device.platformName}'  RSSI: ${sonuc.rssi}");
-        if (sonuc.device.platformName == cihazIsmi) {
-          cihazBulundu = true;
-          await taramaAbonelik.cancel();
-          await FlutterBluePlus.stopScan();
-          await _cihazaBaglan(sonuc.device);
-          break;
-        }
-      }
+    _pollTimer?.cancel();
+    setState(() {
+      _durum = "ESP32'ye bağlanılıyor...";
+      _bagli = false;
     });
 
-    // Dinleyici kurulduktan SONRA taramayı başlat (await ile bloklamıyoruz,
-    // böylece kod hemen devam eder ve sonuçlar dinleyiciye akar)
-    unawaited(FlutterBluePlus.startScan(timeout: const Duration(seconds: 8)));
-
-    // 8 saniye sonra hâlâ bulunamadıysa kullanıcıyı bilgilendir
-    Future.delayed(const Duration(seconds: 9), () {
-      if (!cihazBulundu && mounted && _durum == "Taranıyor...") {
-        setState(() => _durum = "Cihaz bulunamadı — ESP32 açık mı, yayında mı kontrol et");
-        debugPrint("HATA: '$cihazIsmi' isimli cihaz 8 saniyede bulunamadı.");
-      }
-    });
-  }
-
-  Timer? _ilkVeriBekleTimer;
-  bool _ilkVeriGeldi = false;
-
-  Future<void> _cihazaBaglan(BluetoothDevice cihaz) async {
-    final baslangic = DateTime.now();
-    setState(() => _durum = "Bağlanıyor...");
-    debugPrint("[${DateTime.now()}] Bağlanılıyor: ${cihaz.platformName}");
-    _cihaz = cihaz;
-    _ilkVeriGeldi = false;
-
+    // Kaldığımız yeri (varsa, önceki oturumdan) yükle — böylece uygulama
+    // yeniden açılsa bile veri baştan değil, kaldığı sıradan senkronize edilir.
     try {
-      // Zaman aşımı ekliyoruz: bağlantı takılı kalırsa 15 saniyede hata verip
-      // bekletmeden kullanıcıyı bilgilendirsin (eskiden süresiz bekliyordu).
-      await cihaz.connect(
-        timeout: const Duration(seconds: 15),
-        autoConnect: false,
-      );
-      debugPrint("[${DateTime.now()}] Bağlantı kuruldu (${DateTime.now().difference(baslangic).inSeconds} sn), servisler taranıyor...");
-
-      // Android varsayılan olarak bağlantıyı "düşük güç" moduna düşürebiliyor
-      // (uzun connection interval / peripheral latency) — bu da ESP32'nin
-      // saniyede gönderdiği paketlerin telefona onlarca saniye arayla,
-      // toplu halde ulaşmasına neden olabilir. Bağlantı önceliğini
-      // "high" isteyerek Android'den kısa aralıklı, düşük gecikmeli
-      // bağlantı istiyoruz. (Sadece Android'de çalışır, iOS'ta no-op'tur.)
-      try {
-        await cihaz.requestConnectionPriority(
-          connectionPriorityRequest: ConnectionPriority.high,
-        );
-        debugPrint("[${DateTime.now()}] Bağlantı önceliği 'high' olarak istendi.");
-      } catch (e) {
-        debugPrint("UYARI: requestConnectionPriority başarısız (muhtemelen iOS): $e");
-      }
-
-      // MTU artırma: BLE'de varsayılan MTU 23 bayttır ve bir bildirim en fazla
-      // 20 bayt taşır. Bizim paketimiz ~130 karakter, yani varsayılan MTU ile
-      // paket KESİLİR ve ayrıştırılamaz. ESP32 kendi tarafında setMTU(185) yapıyor
-      // ama MTU pazarlığını telefonun (central) başlatması gerekir.
-      try {
-        await cihaz.requestMtu(247);
-        debugPrint("[${DateTime.now()}] MTU isteği gönderildi (247).");
-      } catch (e) {
-        debugPrint("UYARI: requestMtu başarısız: $e");
-      }
-
-      // Gerçek bağlantı kopmalarını yakalamak için dinleyici.
-      // Bu olmadan, BLE sessizce kopup tekrar bağlansa bile ekranda hiçbir iz kalmıyordu
-      // ve "Bağlı — veri akıyor" yazısı donup kalıyordu; uzun sessizliklerin gerçek
-      // sebebi kopma mı yoksa sadece paket kaybı mı, ayırt edilemiyordu.
-      _baglantiDurumuAbonelik?.cancel();
-      _baglantiDurumuAbonelik = cihaz.connectionState.listen((durum) {
-        debugPrint("[${DateTime.now()}] BLE bağlantı durumu değişti: $durum");
-        if (durum == BluetoothConnectionState.disconnected) {
-          _kopmaSayaci++;
-          _ilkVeriGeldi = false;
-          if (mounted) {
-            setState(() => _durum = "Bağlantı koptu (${_kopmaSayaci}. kez) — yeniden bağlanılıyor...");
-          }
-          debugPrint("UYARI: Gerçek BLE kopması tespit edildi (${_kopmaSayaci}. kez). Yeniden bağlanılıyor...");
-          // Otomatik yeniden bağlan (ESP32 kopunca zaten tekrar yayına geçiyor)
-          Future.delayed(const Duration(milliseconds: 500), () {
-            if (mounted) _cihazaBaglan(cihaz);
-          });
-        }
-      });
-
-      final servisler = await cihaz.discoverServices();
-      debugPrint("[${DateTime.now()}] Bulunan servis sayısı: ${servisler.length}");
-
-      bool karakteristikBulundu = false;
-
-      for (final servis in servisler) {
-        debugPrint("  Servis: ${servis.uuid}");
-        if (servis.uuid.toString().toLowerCase() == servisUuid.toLowerCase()) {
-          for (final karak in servis.characteristics) {
-            debugPrint("    Karakteristik: ${karak.uuid}");
-            if (karak.uuid.toString().toLowerCase() == karakteristikUuid.toLowerCase()) {
-              karakteristikBulundu = true;
-              await karak.setNotifyValue(true);
-              debugPrint("[${DateTime.now()}] Notify aktifleştirildi, veri bekleniyor...");
-              karak.lastValueStream.listen((veri) {
-                final metin = utf8.decode(veri, allowMalformed: true);
-                debugPrint("[${DateTime.now()}] Gelen veri (${veri.length} bayt): $metin");
-
-                if (!_ilkVeriGeldi) {
-                  _ilkVeriGeldi = true;
-                  _ilkVeriBekleTimer?.cancel();
-                  if (mounted) setState(() => _durum = "Bağlı — veri akıyor");
-                }
-                _veriEkle(metin);
-              });
-            }
-          }
-        }
-      }
-
-      if (!karakteristikBulundu) {
-        setState(() => _durum = "Servis/karakteristik UUID eşleşmedi — .ino dosyasındaki UUID'leri kontrol et");
-        debugPrint("HATA: Beklenen servis/karakteristik UUID bulunamadı.");
-        return;
-      }
-
-      // Notify açıldı ama henüz hiç paket gelmedi — bu gerçek durum.
-      // "veri akıyor" yazısını ilk paket gelmeden GÖSTERMİYORUZ artık.
-      setState(() => _durum = "Bildirim açıldı — ilk veri bekleniyor...");
-
-      _ilkVeriBekleTimer?.cancel();
-      _ilkVeriBekleTimer = Timer(const Duration(seconds: 10), () {
-        if (mounted && !_ilkVeriGeldi) {
-          setState(() => _durum = "10 saniyedir veri gelmiyor — ESP32 Serial Monitor'de paket akıyor mu kontrol et");
-          debugPrint("UYARI: Notify açık ama 10 saniyedir hiç paket gelmedi.");
-        }
-      });
+      final tercihler = await SharedPreferences.getInstance();
+      _sonSira = tercihler.getInt(_sonSiraAnahtari) ?? 0;
+      debugPrint("[${DateTime.now()}] Kaydedilmiş son sıra yüklendi: $_sonSira");
     } catch (e) {
-      setState(() => _durum = "Bağlantı hatası: $e");
-      debugPrint("HATA (bağlantı): $e");
+      debugPrint("UYARI: Kaydedilmiş sıra okunamadı: $e");
+      _sonSira = 0;
     }
+
+    // ESP32'ye gerçekten ulaşılabiliyor mu diye önce /durum ile test ediyoruz.
+    // Bu, kullanıcıya "WiFi ağına bağlanmayı unuttun" ile "ESP32 kapalı/menzil dışı"
+    // durumlarını net bir mesajla ayırt etmemizi sağlıyor.
+    try {
+      final yanit = await http
+          .get(Uri.parse('http://$_esp32Ip/durum'))
+          .timeout(const Duration(seconds: 5));
+      if (yanit.statusCode != 200) throw Exception('HTTP ${yanit.statusCode}');
+      debugPrint("[${DateTime.now()}] ESP32 /durum yanıtı: ${yanit.body}");
+    } catch (e) {
+      setState(() {
+        _durum = 'ESP32\'ye ($_esp32Ip) ulaşılamıyor — hotspot açık mı, ESP32 çalışıyor mu '
+            've IP doğru mu kontrol et (Serial Monitor\'den doğrula)';
+      });
+      debugPrint("HATA: /durum isteğine ulaşılamadı: $e");
+      return;
+    }
+
+    setState(() {
+      _bagli = true;
+      _durum = "Bağlı — veri senkronize ediliyor...";
+      _ardisikBasarisizSayisi = 0;
+    });
+
+    // İlk isteği hemen at (bekletmeden), sonra saniyede bir tekrar et.
+    // ESP32 saniyede 1 kayıt ürettiği için bu aralık yeterli; eğer araya
+    // uzun bir kopukluk girdiyse ilk birkaç istek arka arkaya 100'er kayıtlık
+    // "geçmişi kapatma" turları yapar (bkz. _veriCek içindeki mesaj).
+    _veriCek();
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) => _veriCek());
   }
 
-  // "B1:30.55,B2:30.31,B3:30.35,B4:30.20,REF:30.13,DT1:..,DT2:..,DT3:..,DT4:..,ALARM:0/1,..." metnini ayrıştırır
-  void _veriEkle(String ham) {
+  Future<void> _veriCek() async {
+    if (_istekDevamEdiyor) return; // önceki istek hâlâ sürüyorsa üst üste binmesin
+    _istekDevamEdiyor = true;
+    _toplamIstekSayisi++;
+
     try {
-      final parcalar = ham.trim().split(',');
-      final degerler = <String, String>{};
-      for (final p in parcalar) {
-        final ikili = p.split(':');
-        if (ikili.length == 2) degerler[ikili[0]] = ikili[1];
+      final yanit = await http
+          .get(Uri.parse('http://$_esp32Ip/gecmis?sonSira=$_sonSira'))
+          .timeout(const Duration(seconds: 4));
+
+      if (yanit.statusCode != 200) {
+        throw Exception('HTTP ${yanit.statusCode}');
       }
 
-      final b1 = double.parse(degerler['B1']!);
-      final b2 = double.parse(degerler['B2']!);
-      final b3 = double.parse(degerler['B3']!);
-      final b4 = double.parse(degerler['B4']!);
-      final ref = double.parse(degerler['REF']!);
-      final dt1 = double.parse(degerler['DT1']!);
-      final dt2 = double.parse(degerler['DT2']!);
-      final dt3 = double.parse(degerler['DT3']!);
-      final dt4 = double.parse(degerler['DT4']!);
-      final alarm = degerler['ALARM'] == '1';
+      // Bağlantı sağlıklı: ardışık başarısızlık sayacını sıfırla.
+      _ardisikBasarisizSayisi = 0;
 
-      setState(() {
+      final govde = jsonDecode(yanit.body) as Map<String, dynamic>;
+      final kayitlar = (govde['kayitlar'] as List).cast<Map<String, dynamic>>();
+      final veriAtlandi = govde['veriAtlandi'] == true;
+
+      _sonHam = yanit.body.length > 200 ? '${yanit.body.substring(0, 200)}…' : yanit.body;
+
+      if (veriAtlandi && !_veriKaybiUyarisiGosterildi) {
+        _veriKaybiUyarisiGosterildi = true;
+        debugPrint(
+            "UYARI: ESP32'nin arabelleği (30 dk) dolup taştığı için bazı geçmiş kayıtlar kalıcı olarak kayboldu.");
+      }
+
+      for (final kayit in kayitlar) {
+        final b1 = (kayit['b1'] as num).toDouble();
+        final b2 = (kayit['b2'] as num).toDouble();
+        final b3 = (kayit['b3'] as num).toDouble();
+        final b4 = (kayit['b4'] as num).toDouble();
+        final ref = (kayit['ref'] as num).toDouble();
+        final dt1 = (kayit['dt1'] as num).toDouble();
+        final dt2 = (kayit['dt2'] as num).toDouble();
+        final dt3 = (kayit['dt3'] as num).toDouble();
+        final dt4 = (kayit['dt4'] as num).toDouble();
+        final alarm = kayit['alarm'] == true;
+        final sira = (kayit['sira'] as num).toInt();
+
         _ekleVeSinirla(_b1, b1);
         _ekleVeSinirla(_b2, b2);
         _ekleVeSinirla(_b3, b3);
         _ekleVeSinirla(_b4, b4);
-        _sonPaketZamani = DateTime.now();
-      });
 
-      // Her gelen paketi veritabanına kalıcı olarak kaydet (ölçüm geçmişi)
-      _veritabani.olcumEkle(Olcum(
-        hastaId: widget.hasta.id,
-        zaman: DateTime.now().toIso8601String(),
-        b1: b1, b2: b2, b3: b3, b4: b4, ref: ref,
-        dt1: dt1, dt2: dt2, dt3: dt3, dt4: dt4,
-        alarm: alarm,
-      ));
-    } catch (_) {
-      // bozuk/eksik paket geldiyse yok say
+        _sonSira = sira;
+        _paketSayaci++;
+
+        // Her kaydı veritabanına kalıcı olarak yaz (ölçüm geçmişi).
+        // zaman olarak ESP32'nin kendi saatini değil, HTTP yanıtının telefona
+        // ULAŞTIĞI anı kullanıyoruz — ESP32'nin zamanMs değeri sadece kendi
+        // açılışından beri geçen süre, gerçek saat değil.
+        unawaited(_veritabani.olcumEkle(Olcum(
+          hastaId: widget.hasta.id,
+          zaman: DateTime.now().toIso8601String(),
+          b1: b1, b2: b2, b3: b3, b4: b4, ref: ref,
+          dt1: dt1, dt2: dt2, dt3: dt3, dt4: dt4,
+          alarm: alarm,
+        )));
+      }
+
+      if (kayitlar.isNotEmpty) {
+        _sonPaketZamani = DateTime.now();
+        unawaited(_sonSirayiKaliciKaydet());
+      }
+
+      if (mounted) {
+        setState(() {
+          _durum = kayitlar.length >= 100
+              ? 'Bağlı — geçmiş veriler senkronize ediliyor (bu turda ${kayitlar.length} kayıt alındı)...'
+              : 'Bağlı — veri akıyor';
+        });
+      }
+    } catch (e) {
+      _ardisikBasarisizSayisi++;
+      debugPrint("HATA (HTTP istek, sonSira=$_sonSira): $e");
+      // Her başarısız denemede değil, sadece kopmanın BAŞLADIĞI anda sayaç
+      // artsın ve kullanıcı bilgilendirilsin (3 ardışık başarısızlık ~ birkaç sn).
+      if (_ardisikBasarisizSayisi == 3 && mounted) {
+        _kopmaSayaci++;
+        setState(() {
+          _bagli = false;
+          _durum = "ESP32'ye ulaşılamıyor (${_kopmaSayaci}. kez) — WiFi ağını ve ESP32'yi kontrol et";
+        });
+      }
+    } finally {
+      _istekDevamEdiyor = false;
+    }
+  }
+
+  Future<void> _sonSirayiKaliciKaydet() async {
+    try {
+      final tercihler = await SharedPreferences.getInstance();
+      await tercihler.setInt(_sonSiraAnahtari, _sonSira);
+    } catch (e) {
+      debugPrint("UYARI: son sıra kaydedilemedi: $e");
     }
   }
 
@@ -373,6 +375,66 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
           child: Column(
             children: [
               Text(_durum, style: const TextStyle(fontSize: 14, color: Colors.grey)),
+              const SizedBox(height: 4),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      'ESP32 adresi: http://$_esp32Ip',
+                      style: const TextStyle(fontSize: 11, color: Colors.blueGrey),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'IP adresini değiştir',
+                    icon: const Icon(Icons.edit, size: 16),
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: _ipDegistirDiyaloguGoster,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              // TEŞHİS KUTUSU: istek sayısı ile işlenen kayıt sayısı birlikte
+              // izlenerek "hiç bağlanamıyoruz" ile "bağlanıyoruz ama veri
+              // gelmiyor" durumları ayırt edilebiliyor.
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.amber.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.amber.shade200),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'İstek: $_toplamIstekSayisi   |   İşlenen kayıt: $_paketSayaci   |   Bağlantı kaybı: $_kopmaSayaci',
+                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _sonHam.isEmpty
+                          ? 'Son yanıt: (henüz yok)'
+                          : 'Son yanıt: $_sonHam',
+                      style: const TextStyle(fontSize: 10, color: Colors.black87),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (_veriKaybiUyarisiGosterildi)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 4),
+                        child: Text(
+                          'UYARI: ESP32 arabelleği (30 dk) dolduğu için bazı geçmiş kayıtlar kalıcı olarak kayboldu.',
+                          style: TextStyle(fontSize: 10, color: Colors.red, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
               const SizedBox(height: 8),
               if (_b1.isNotEmpty)
                 Container(
@@ -440,7 +502,10 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
               const SizedBox(height: 12),
               SizedBox(
                 width: double.infinity,
-                child: ElevatedButton(onPressed: _baglan, child: const Text('Cihaza Bağlan')),
+                child: ElevatedButton(
+                  onPressed: _baglan,
+                  child: Text(_bagli ? 'Yeniden Senkronize Et' : 'ESP32\'ye Bağlan'),
+                ),
               ),
               const SizedBox(height: 8),
             ],

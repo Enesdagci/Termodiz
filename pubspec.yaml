@@ -17,8 +17,12 @@ dependencies:
   path_provider: ^2.1.1
   permission_handler: ^11.3.1
 
+
   flutter_blue_plus: ^1.32.12
   fl_chart: ^0.68.0
+
+  http: ^1.6.0
+  shared_preferences: ^2.5.5  
 
   cupertino_icons: ^1.0.8
 

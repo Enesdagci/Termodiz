@@ -169,6 +169,20 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
       return;
     }
 
+    // Telefonun saatini ESP32'ye gönderiyoruz ki store-and-forward ile
+    // yakalanan GEÇMİŞ kayıtlar da "şimdi" yerine GERÇEK ölçüm anıyla
+    // damgalanabilsin. Başarısız olursa akışı durdurmuyoruz — o durumda
+    // kayıtlar eskisi gibi telefona ulaştığı anla damgalanmaya devam eder.
+    try {
+      final unixSaniye = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      await http
+          .get(Uri.parse('http://$_esp32Ip/zamanAyarla?unixSaniye=$unixSaniye'))
+          .timeout(const Duration(seconds: 5));
+      debugPrint("[${DateTime.now()}] ESP32 saati senkronize edildi ($unixSaniye).");
+    } catch (e) {
+      debugPrint("UYARI: Saat senkronize edilemedi (kayıtlar 'şimdi' zamanıyla damgalanacak): $e");
+    }
+
     setState(() {
       _bagli = true;
       _durum = "Bağlı — veri senkronize ediliyor...";
@@ -224,6 +238,7 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
         final dt4 = (kayit['dt4'] as num).toDouble();
         final alarm = kayit['alarm'] == true;
         final sira = (kayit['sira'] as num).toInt();
+        final unixSaniye = (kayit['unixSaniye'] as num?)?.toInt() ?? 0;
 
         _ekleVeSinirla(_b1, b1);
         _ekleVeSinirla(_b2, b2);
@@ -234,12 +249,18 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
         _paketSayaci++;
 
         // Her kaydı veritabanına kalıcı olarak yaz (ölçüm geçmişi).
-        // zaman olarak ESP32'nin kendi saatini değil, HTTP yanıtının telefona
-        // ULAŞTIĞI anı kullanıyoruz — ESP32'nin zamanMs değeri sadece kendi
-        // açılışından beri geçen süre, gerçek saat değil.
+        // ESP32 ile saat senkronizasyonu yapıldıysa (bkz. _baglan içindeki
+        // /zamanAyarla çağrısı), her kayıt kendi GERÇEK ölçüm anıyla (unixSaniye)
+        // damgalanır — bu sayede store-and-forward ile geç ulaşan geçmiş
+        // kayıtlar da doğru zamanla kaydedilir. Senkronizasyon henüz
+        // yapılmadıysa (unixSaniye alanı yoksa/0 ise) eski davranışa dönüp
+        // HTTP yanıtının telefona ULAŞTIĞI an kullanılır.
+        final zamanDt = unixSaniye > 0
+            ? DateTime.fromMillisecondsSinceEpoch(unixSaniye * 1000)
+            : DateTime.now();
         unawaited(_veritabani.olcumEkle(Olcum(
           hastaId: widget.hasta.id,
-          zaman: DateTime.now().toIso8601String(),
+          zaman: zamanDt.toIso8601String(),
           b1: b1, b2: b2, b3: b3, b4: b4, ref: ref,
           dt1: dt1, dt2: dt2, dt3: dt3, dt4: dt4,
           alarm: alarm,

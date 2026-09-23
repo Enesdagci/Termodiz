@@ -1,9 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/services.dart' show SystemSound, SystemSoundType, HapticFeedback;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart' show getDatabasesPath;
+import 'package:path/path.dart' as p;
+import 'package:share_plus/share_plus.dart';
 import 'package:fl_chart/fl_chart.dart';
 import '../models/hasta.dart';
 import '../services/database_service.dart';
@@ -59,6 +63,25 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
   // veriyi "canlı" gibi göstermeyi önler.
   DateTime? _sonPaketZamani;
   Timer? _tazelikTimer;
+
+  // Alarm bildirimi: ESP32'den gelen en güncel kayıt "alarm:true" diyorsa
+  // (kritik sıcaklık farkı tespit edildiyse) kullanıcıyı ses + titreşim +
+  // ekranda kırmızı bir banner ile uyarıyoruz. Alarm başladığında hemen,
+  // devam ederse en fazla _alarmTekrarAraligi'nda bir tekrar uyarıyoruz —
+  // sürekli spam etmeden ama unutulmasın diye.
+  bool _alarmAktif = false;
+  DateTime? _sonAlarmUyariZamani;
+  int _alarmSayaci = 0; // bu oturumda kaç kez YENİ bir alarm başladığı (teşhis için)
+  static const Duration _alarmTekrarAraligi = Duration(seconds: 30);
+
+  // Flash günlüğü arşivleme: dosyalar telefonun uygulamaya özel (gizli)
+  // depolama alanına kaydediliyor — bir Dosya Yöneticisi'nden görünmüyor,
+  // ama bunun uygulamanın kendisi için bir sorun olmaması gerekiyor. Bu
+  // yüzden "gerçekten kaydedildi mi" sorusunu dosya yöneticisiyle değil,
+  // doğrudan ekranda göstererek cevaplıyoruz.
+  int _arsivlenenGunlukSayisi = 0; // bu oturumda başarıyla arşivlenen dosya sayısı
+  int _arsivlenenGunlukToplamBayt = 0; // bu oturumda arşivlenen toplam veri (bayt)
+  final List<String> _sonArsivlenenDosyalar = []; // en son indirilen (aktif+varsa yedek) dosyaların tam yolu — paylaşmak için
 
   @override
   void initState() {
@@ -160,6 +183,24 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
           .timeout(const Duration(seconds: 5));
       if (yanit.statusCode != 200) throw Exception('HTTP ${yanit.statusCode}');
       debugPrint("[${DateTime.now()}] ESP32 /durum yanıtı: ${yanit.body}");
+
+      // ESP32 yeniden başlatılmışsa (yeni kod yüklendi, güç kesintisi vb.),
+      // üretim sayacı (toplamUretilen) sıfırdan başlar. Telefonda kayıtlı
+      // sonSira hâlâ ESKİ (daha büyük) bir oturumdan kalmışsa, "sonSira'dan
+      // büyük kayıt" arayışı hiçbir zaman eşleşmez ve grafik sonsuza dek boş
+      // kalır. Bunu burada tespit edip sayacı sıfırlıyoruz.
+      try {
+        final durumGovde = jsonDecode(yanit.body) as Map<String, dynamic>;
+        final toplamUretilen = (durumGovde['toplamUretilen'] as num?)?.toInt() ?? 0;
+        if (_sonSira > toplamUretilen) {
+          debugPrint(
+              "UYARI: ESP32 yeniden baslamis gibi gorunuyor (kayitli sonSira=$_sonSira > ESP32 toplamUretilen=$toplamUretilen). Sayac sifirlaniyor.");
+          _sonSira = 0;
+          unawaited(_sonSirayiKaliciKaydet());
+        }
+      } catch (e) {
+        debugPrint("UYARI: /durum yanıtı ayrıştırılamadı, sonSira kontrolü atlanıyor: $e");
+      }
     } catch (e) {
       setState(() {
         _durum = 'ESP32\'ye ($_esp32Ip) ulaşılamıyor — hotspot açık mı, ESP32 çalışıyor mu '
@@ -169,10 +210,18 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
       return;
     }
 
+    // ESP32'nin flash'taki ham günlüğünü (CSV) telefona indirip kalıcı olarak
+    // arşivliyoruz. Bunu ÖNCE yapmamız şart: bir sonraki adımdaki
+    // /zamanAyarla isteği, ESP32 tarafında flash günlüğünü otomatik olarak
+    // temizliyor (alan sorununa karşı) — indirme temizlemeden önce
+    // tamamlanmazsa o veriler kalıcı olarak kaybolur.
+    await _gunlukleriIndirVeArsivle();
+
     // Telefonun saatini ESP32'ye gönderiyoruz ki store-and-forward ile
     // yakalanan GEÇMİŞ kayıtlar da "şimdi" yerine GERÇEK ölçüm anıyla
     // damgalanabilsin. Başarısız olursa akışı durdurmuyoruz — o durumda
     // kayıtlar eskisi gibi telefona ulaştığı anla damgalanmaya devam eder.
+    // (Bu istek aynı zamanda ESP32'deki flash günlüğünü temizletir — bkz. yukarısı.)
     try {
       final unixSaniye = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       await http
@@ -217,6 +266,20 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
       final govde = jsonDecode(yanit.body) as Map<String, dynamic>;
       final kayitlar = (govde['kayitlar'] as List).cast<Map<String, dynamic>>();
       final veriAtlandi = govde['veriAtlandi'] == true;
+      final toplamUretilen = (govde['toplamUretilen'] as num?)?.toInt() ?? 0;
+
+      // _baglan() sadece BAĞLANMA anında "ESP32 resetlendi mi" kontrolü yapıyor.
+      // Ama ESP32, biz zaten bağlıyken de resetlenebilir (güç kesintisi, yeniden
+      // flaşlama vb.) — bu durumda devam eden 1 saniyelik yoklama döngüsü kendi
+      // kendine düzelmez, çünkü sonSira hâlâ ESKİ (daha yüksek) değerde kalır ve
+      // /gecmis sürekli boş döner. Aynı kontrolü bu yüzden HER yoklamada da
+      // yapıyoruz — ekstra bir istek gerekmiyor, toplamUretilen zaten bu yanıtta var.
+      if (_sonSira > toplamUretilen) {
+        debugPrint(
+            "UYARI: ESP32 sayacı bağlantı kurulduktan SONRA düşmüş/resetlenmiş görünüyor (sonSira=$_sonSira > toplamUretilen=$toplamUretilen). Sayaç sıfırlanıyor.");
+        _sonSira = 0;
+        unawaited(_sonSirayiKaliciKaydet());
+      }
 
       _sonHam = yanit.body.length > 200 ? '${yanit.body.substring(0, 200)}…' : yanit.body;
 
@@ -226,6 +289,7 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
             "UYARI: ESP32'nin arabelleği (30 dk) dolup taştığı için bazı geçmiş kayıtlar kalıcı olarak kayboldu.");
       }
 
+      bool sonKaydinAlarmDurumu = _alarmAktif; // hiç yeni kayit gelmezse mevcut durum korunsun
       for (final kayit in kayitlar) {
         final b1 = (kayit['b1'] as num).toDouble();
         final b2 = (kayit['b2'] as num).toDouble();
@@ -247,6 +311,7 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
 
         _sonSira = sira;
         _paketSayaci++;
+        sonKaydinAlarmDurumu = alarm; // kayıtlar sıra ile geliyor, en son işlenen "güncel" durum
 
         // Her kaydı veritabanına kalıcı olarak yaz (ölçüm geçmişi).
         // ESP32 ile saat senkronizasyonu yapıldıysa (bkz. _baglan içindeki
@@ -270,6 +335,25 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
       if (kayitlar.isNotEmpty) {
         _sonPaketZamani = DateTime.now();
         unawaited(_sonSirayiKaliciKaydet());
+
+        // Alarm bildirimi: en son işlenen kayıt alarm veriyorsa kullanıcıyı
+        // ses + titreşimle uyar. Alarm YENİ başladıysa hemen; devam ediyorsa
+        // en fazla _alarmTekrarAraligi'nda bir tekrar uyar (sürekli spam etmeden).
+        if (sonKaydinAlarmDurumu) {
+          final simdi = DateTime.now();
+          final ilkUyari = !_alarmAktif;
+          final tekrarZamaniGeldi = _sonAlarmUyariZamani == null ||
+              simdi.difference(_sonAlarmUyariZamani!) >= _alarmTekrarAraligi;
+          if (ilkUyari || tekrarZamaniGeldi) {
+            _sonAlarmUyariZamani = simdi;
+            if (ilkUyari) _alarmSayaci++;
+            SystemSound.play(SystemSoundType.alert);
+            HapticFeedback.vibrate();
+          }
+          _alarmAktif = true;
+        } else {
+          _alarmAktif = false; // durum normale döndü, bir sonraki tetiklenmede tekrar uyarılabilsin
+        }
       }
 
       if (mounted) {
@@ -288,7 +372,7 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
         _kopmaSayaci++;
         setState(() {
           _bagli = false;
-          _durum = "ESP32'ye ulaşılamıyor (${_kopmaSayaci}. kez) — WiFi ağını ve ESP32'yi kontrol et";
+          _durum = "ESP32'ye ulaşılamıyor ($_kopmaSayaci. kez) — WiFi ağını ve ESP32'yi kontrol et";
         });
       }
     } finally {
@@ -302,6 +386,54 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
       await tercihler.setInt(_sonSiraAnahtari, _sonSira);
     } catch (e) {
       debugPrint("UYARI: son sıra kaydedilemedi: $e");
+    }
+  }
+
+  // ESP32'nin flash (SPIFFS) günlüğünü indirip telefona kalıcı olarak
+  // arşivler. ESP32 her bağlantıda flash günlüğünü otomatik temizlediği için
+  // (bkz. ESP32 /zamanAyarla), bu indirme ESP32'deki tek kopyanın kaybolmadan
+  // önce alınan yedeğidir. Hem aktif (/gunlukIndir) hem varsa yedek
+  // (/gunlukIndirYedek — bir önceki rotasyondan kalan) dosya indirilir.
+  // Herhangi biri başarısız olursa (ör. dosya yok, 404) sessizce atlanır —
+  // bağlantı akışını durdurmaz.
+  Future<void> _gunlukleriIndirVeArsivle() async {
+    _sonArsivlenenDosyalar.clear(); // her bağlantıda "son indirilenler" listesi yenilensin
+    final unixSaniye = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    await _tekGunlukIndir('/gunlukIndir', 'gunluk_${widget.hasta.id}_$unixSaniye.csv');
+    await _tekGunlukIndir('/gunlukIndirYedek', 'gunluk_eski_${widget.hasta.id}_$unixSaniye.csv');
+  }
+
+  Future<void> _tekGunlukIndir(String yol, String dosyaAdi) async {
+    try {
+      final yanit = await http
+          .get(Uri.parse('http://$_esp32Ip$yol'))
+          .timeout(const Duration(seconds: 10));
+      if (yanit.statusCode != 200 || yanit.bodyBytes.isEmpty) return;
+
+      final klasorYolu = p.join(await getDatabasesPath(), 'gunluk_yedekleri');
+      final klasor = Directory(klasorYolu);
+      if (!await klasor.exists()) await klasor.create(recursive: true);
+
+      final dosya = File(p.join(klasorYolu, dosyaAdi));
+      await dosya.writeAsBytes(yanit.bodyBytes);
+      debugPrint("[${DateTime.now()}] Günlük arşivlendi: ${dosya.path} (${yanit.bodyBytes.length} bayt)");
+      _sonArsivlenenDosyalar.add(dosya.path);
+
+      // Dosya yöneticisinden görünmediği için başarıyı doğrudan ekranda
+      // gösteriyoruz — teşhis kutusundaki sayaç bunun için. Paylaş butonu
+      // da bu dosyayı, konumuna bakılmaksızın (gizli klasörde olsa bile)
+      // paylaşabiliyor.
+      if (mounted) {
+        setState(() {
+          _arsivlenenGunlukSayisi++;
+          _arsivlenenGunlukToplamBayt += yanit.bodyBytes.length;
+        });
+      } else {
+        _arsivlenenGunlukSayisi++;
+        _arsivlenenGunlukToplamBayt += yanit.bodyBytes.length;
+      }
+    } catch (e) {
+      debugPrint("UYARI: Günlük indirilemedi ($yol): $e");
     }
   }
 
@@ -397,6 +529,36 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
             children: [
               Text(_durum, style: const TextStyle(fontSize: 14, color: Colors.grey)),
               const SizedBox(height: 4),
+              // ALARM BANNER: son işlenen kayıt kritik sıcaklık farkı gösteriyorsa
+              // (bkz. _veriCek), burada göze çarpan bir uyarı gösteriyoruz. Aynı anda
+              // ses + titreşim de tetiklenmiş oluyor (bkz. _veriCek).
+              if (_alarmAktif)
+                Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.red, width: 2),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.warning_amber_rounded, color: Colors.red, size: 28),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'UYARI: Kritik sıcaklık farkı tespit edildi! Bölgeler arasında beklenenden fazla fark ölçülüyor.',
+                          style: TextStyle(
+                            color: Colors.red.shade900,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -433,7 +595,7 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'İstek: $_toplamIstekSayisi   |   İşlenen kayıt: $_paketSayaci   |   Bağlantı kaybı: $_kopmaSayaci',
+                      'İstek: $_toplamIstekSayisi   |   İşlenen kayıt: $_paketSayaci   |   Bağlantı kaybı: $_kopmaSayaci   |   Alarm: $_alarmSayaci',
                       style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 2),
@@ -444,6 +606,35 @@ class _GrafikSayfasiState extends State<GrafikSayfasi> {
                       style: const TextStyle(fontSize: 10, color: Colors.black87),
                       maxLines: 3,
                       overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _arsivlenenGunlukSayisi == 0
+                                ? 'Flash günlük arşivi: henüz yok'
+                                : 'Flash günlük arşivi: $_arsivlenenGunlukSayisi dosya, $_arsivlenenGunlukToplamBayt bayt (telefonda kayıtlı)',
+                            style: const TextStyle(fontSize: 10, color: Colors.black87),
+                          ),
+                        ),
+                        if (_sonArsivlenenDosyalar.isNotEmpty)
+                          IconButton(
+                            tooltip: 'Son arşivlenen günlüğü paylaş',
+                            icon: const Icon(Icons.share, size: 16),
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
+                            onPressed: () {
+                              SharePlus.instance.share(
+                                ShareParams(
+                                  files: _sonArsivlenenDosyalar.map((yol) => XFile(yol)).toList(),
+                                  text: 'Termodiz flash günlüğü — ${widget.hasta.ad}',
+                                ),
+                              );
+                            },
+                          ),
+                      ],
                     ),
                     if (_veriKaybiUyarisiGosterildi)
                       const Padding(
